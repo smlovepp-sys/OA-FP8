@@ -1,0 +1,109 @@
+import os
+import torch
+import torch.nn.functional as F
+from safetensors.torch import load_file, save_file
+from tqdm import tqdm
+
+# ================= 路径配置 =================
+INPUT_MODEL = r"D:\path\to\your\model.safetensors"          # 原始 SDXL 模型
+OUTPUT_MODEL = r"D:\path\to\your\oa_package.safetensors"   # OA 压缩包输出路径
+
+# ================= 压缩参数 =================
+BLOCK_SIZE = 32
+SIGMA = 3.2
+FP8_MAX = 448.0
+
+def is_sensitive(key, tensor):
+    """敏感层保护：返回 True 则保留 FP16，不压缩"""
+    k = key.lower()
+    if key.startswith("first_stage_model."):   # VAE 全部保护
+        return True
+    if "bias" in k or "norm" in k or "ln_" in k or "embedding" in k:
+        return True
+    if "time_embed" in k or "label_emb" in k:
+        return True
+    if tensor.numel() <= 1000:
+        return True
+    # 只压缩 UNet 和 CLIP 的非敏感权重
+    if key.startswith("model.diffusion_model.") or key.startswith("conditioner.embedders."):
+        return False
+    return True
+
+def compress_tensor(tensor):
+    shape = tensor.shape
+    x = tensor.flatten().float()
+
+    # 处理不足块大小的填充
+    pad_len = (BLOCK_SIZE - x.numel() % BLOCK_SIZE) % BLOCK_SIZE
+    if pad_len:
+        x = F.pad(x, (0, pad_len))
+
+    blocks = x.view(-1, BLOCK_SIZE)
+    mean = blocks.mean(dim=1, keepdim=True)
+    residual = blocks - mean
+
+    # 逐块异常值检测（每块独立标准差）
+    std = residual.std(dim=1, keepdim=True, unbiased=False)
+    threshold = SIGMA * std
+    mask = residual.abs() > threshold
+
+    outlier_idx = torch.nonzero(mask.flatten()).int()
+    outlier_val = residual.flatten()[outlier_idx[:, 0]].half() if outlier_idx.numel() else torch.empty(0, dtype=torch.float16)
+
+    clean = residual.clone()
+    clean[mask] = 0.0
+
+    # 块级缩放
+    max_abs = clean.abs().max(dim=1, keepdim=True)[0].clamp(min=1e-8)
+    scale = max_abs / FP8_MAX
+
+    # 量化残差到 FP8
+    quant = (clean / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+
+    return {
+        "block_mean": mean.half().contiguous(),
+        "block_scale": scale.half().contiguous(),
+        "block_residual": quant.contiguous(),
+        "outlier_indices": outlier_idx.contiguous(),
+        "outlier_values": outlier_val.contiguous(),
+        "pad_len": torch.tensor([pad_len], dtype=torch.int32),
+        "original_shape": torch.tensor(list(shape), dtype=torch.int32),
+    }, outlier_idx.numel()
+
+def main():
+    print(f"读取模型: {INPUT_MODEL}")
+    state_dict = load_file(INPUT_MODEL, device="cpu")
+
+    output = {}
+    safe_count = 0
+    compress_count = 0
+    total_outliers = 0
+
+    for key, tensor in tqdm(state_dict.items(), desc="压缩"):
+        if is_sensitive(key, tensor):
+            # 敏感层保留 FP16
+            output[key] = tensor.to(torch.float16).contiguous()
+            safe_count += 1
+        else:
+            pack, num_out = compress_tensor(tensor)
+            base = key
+            output[base + ".block_mean"] = pack["block_mean"]
+            output[base + ".block_scale"] = pack["block_scale"]
+            output[base + ".block_residual"] = pack["block_residual"]
+            output[base + ".outlier_indices"] = pack["outlier_indices"]
+            output[base + ".outlier_values"] = pack["outlier_values"]
+            output[base + ".pad_len"] = pack["pad_len"]
+            output[base + ".original_shape"] = pack["original_shape"]
+            compress_count += 1
+            total_outliers += num_out
+
+    print(f"敏感层: {safe_count}, 压缩层: {compress_count}, 异常值总数: {total_outliers}")
+    print(f"保存压缩包: {OUTPUT_MODEL}")
+    save_file(output, OUTPUT_MODEL)
+
+    orig_gb = os.path.getsize(INPUT_MODEL) / 1024**3
+    comp_gb = os.path.getsize(OUTPUT_MODEL) / 1024**3
+    print(f"原始: {orig_gb:.2f} GB -> 压缩包: {comp_gb:.2f} GB (压缩比 {orig_gb/comp_gb:.2f}x)")
+
+if __name__ == "__main__":
+    main()
